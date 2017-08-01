@@ -1,0 +1,461 @@
+---
+title: "bestcodeFor2Model"
+author: "Ying Luo, Ying He, Xinru Fang"
+date: "June 11, 2017"
+output: pdf_document
+---
+
+```{r, libraries}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+#library(randomForest)
+#library(gbm)
+library(mlr) # For extensive parametric search,
+# random / grid search procedure to find better accuracy. 
+library(xgboost)
+library(data.table)
+library(caret) # For confusionMatrix()
+library(Matrix) # For sparse.model.matrix()
+library(DT) #R interface to the JavaScript library DataTables, datatable()
+
+#set parallel backend for faster computation
+library(parallel)
+library(parallelMap)
+```
+
+```{r, data preparation & variable creation}
+#set parallel backend for faster computation
+parallelStartSocket(cpus=detectCores())
+
+#turnout time
+lafd_upd <- lafd_upd %>% mutate(Turnout.Time = ifelse(`PPE Level`=="EMS", 60, 80)) 
+
+#number of dispatch
+lafd_upd <- lafd_upd %>% group_by(incident.ID) %>% mutate(nDispatch = n())
+
+#hour of creation
+lafd_upd$hour <- hour(lafd_upd$`Incident Creation Time (GMT)`)
+
+#number of distinct UnitType
+lafd_upd <- lafd_upd %>% group_by(incident.ID) %>% 
+  mutate(nUnitType=length(unique(`Unit Type`)))
+
+#1st Dispatch Status
+temp <- lafd_upd %>% group_by(incident.ID) %>% 
+  select(incident.ID, `Dispatch Status`) %>% 
+  summarise(firstDispatchStatus=first(`Dispatch Status`))
+lafd_upd <- merge(lafd_upd, temp, by="incident.ID", all.x=TRUE)
+
+#Include FS info
+FireStations <- read_csv("FireStations.csv")
+colnames(FireStations)[2] <- "First in District"
+lafd_upd <- merge(lafd_upd, FireStations[,c(2,5,10)], by="First in District", all.x=TRUE)
+
+#Include LA City info
+AllStations2013 <- read_csv("AllStations2013.csv") %>% filter(MONTH=="Overall")
+AllStations2014 <- read_csv("AllStations2014.csv") %>% filter(MONTH=="Overall 2014")
+AllStations2015 <- read_csv("AllStations2015.csv") %>% filter(MONTH=="Overall 2015")
+AllStations2016 <- read_csv("AllStations2016.csv") %>% filter(MONTH=="Overall 2016")
+
+files <- list(AllStations2013, AllStations2014, AllStations2015, AllStations2016)
+stationInfo <- data.frame()
+for (file in files) {
+  tb <- gather(file[,1:5], "PPE Level", "aveTurnout", 4:5)
+  tb <- data.frame(tb, 
+                   gather(file[,c(1:3,6:7)], "PPE Level", "aveTravel", 4:5)[,5])
+  tb <- data.frame(tb, 
+                   gather(file[,c(1:3,8:9)], "PPE Level", "inciCount", 4:5)[,5])
+  tb <- tb[,c(1,2,4:7)]
+  stationInfo <- data.frame(rbind(stationInfo, tb))
+  #tb[,3] <- str_trim(str_sub(tb[,3], start = -7, end = -1))
+}
+colnames(stationInfo)[1:3] <- c("year", "First in District", "PPE Level")
+stationInfo$`PPE Level` <- ifelse(grepl("Non",stationInfo$`PPE Level`), "Non-EMS", "EMS")
+
+stationInfo %>% group_by(year, `PPE Level`, `First in District`) %>% count()
+
+lafd_upd <- merge(lafd_upd, stationInfo, by=c("year","PPE Level", "First in District"), all.x = TRUE)
+lafd_upd[,19:20] <- sapply(lafd_upd[,19:20], as.numeric)
+
+# Include population density info
+popDensity <- read.csv("newVar09_Train.csv")
+colnames(popDensity)[2] <- "PopDensity"
+lafd_upd <- merge(lafd_upd, popDensity, by="row.id", all.x=TRUE)
+
+# change year, hour, ZIP to categorical
+lafd_upd$year <- as.character(lafd_upd$year)
+lafd_upd$hour <- as.character(lafd_upd$hour)
+#lafd_upd$`First in District` <- as.character(lafd_upd$`First in District`)
+lafd_upd$ZIP <- as.character(lafd_upd$ZIP)
+
+# group hour
+lafd_upd$timeOfDay <- ifelse(lafd_upd$hour %in% as.character(c(6:14),2,3,5), "peak", "nonPeak")
+
+# group Status
+temp <- c()
+for (i in lafd_upd$`Dispatch Status`) {
+  g <- if(i=="PGR"){"extremeHigh"
+  }else if(i %in% c("CAV", "NAV", "ONS")) {"high"
+  }else if(i %in% c("TSP", "OVD", "WRS")) {"medium"
+  }else if(i %in% c("ENR", "HSP", "AVI", "RAD", "QTR")){"low"}
+  temp <- c(temp, g)
+}
+
+lafd_upd$statusGroup <- ifelse(is.na(lafd_upd$`Dispatch Status`), NA, temp)
+lafd_upd$statusGroup <- as.factor(lafd_upd$statusGroup)
+
+
+# group unitType
+newVar04_Train <- read_csv("~/Desktop/ucla/stats 101C/KaggleFinal/newVar04_Train.csv")
+colnames(newVar04_Train)[2] <- "unitGroup"
+lafd_upd <- merge(lafd_upd, newVar04_Train, by="row.id", all.x = T)
+
+# include mean elapsed time by unit
+newVar05_Train <- read_csv("~/Desktop/ucla/stats 101C/KaggleFinal/newVar05_Train.csv")
+lafd_upd <- merge(lafd_upd, newVar05_Train, by="row.id", all.x = T)
+
+# include mean response time, mean dispatch time, mean arrival time, slow in seconds, 
+# percent MD, and percent fire based on webpage
+X911_response <- readxl::read_excel("911 response.xlsx")
+X911_response <- X911_response[,-2]
+colnames(X911_response)[1] <- "First in District"
+lafd_upd <- merge(lafd_upd, X911_response, by="First in District", all.x = TRUE)
+
+# estimate aveProcess time
+lafd_upd$aveProcess <- lafd_upd$ave_response_seconds-lafd_upd$aveTurnout-lafd_upd$aveTravel
+
+# include mean elapsed time by Dispatch Status
+lafd_upd <- lafd_upd %>% group_by(`Dispatch Status`) %>% 
+  mutate(Mean_ByStatus = mean(elapsed_time, na.rm=T))
+
+# include mean elapsed time by year
+lafd_upd <- lafd_upd %>% group_by(year) %>% 
+  mutate(Mean_ByYear = mean(elapsed_time, na.rm=T))
+
+# include mean elapsed time by hour
+lafd_upd <- lafd_upd %>% group_by(hour) %>% 
+  mutate(Mean_ByHour = mean(elapsed_time, na.rm=T))
+
+# include mean elapsed time by zip
+lafd_upd <- lafd_upd %>% group_by(ZIP) %>% 
+  mutate(Mean_ByZip = mean(elapsed_time, na.rm=T))
+
+# include mean elapsed time by PPE
+lafd_upd <- lafd_upd %>% group_by(`PPE Level`) %>% 
+  mutate(Mean_ByPPE = mean(elapsed_time, na.rm=T))
+
+# cluster zip
+lafd_upd$zipGroup <- cut(lafd_upd$Mean_ByZip, breaks = c(0,500,700,1000), labels = c("ZipSlow", "ZipNormal", "ZipFast"))
+
+# include park
+park <- read_csv("Department_of_Recreation_and_Parks__Facility_and_Park_Information.csv")
+park <- select(park, LocationType, Zip)
+numHill <- filter(park, LocationType %in% c("Lakes", "Golf Courses", "Hiking Trails", "Camps",
+                                            "Beaches")) %>% group_by(Zip) %>% count()
+colnames(numHill) <- c("ZIP","nPark")
+lafd_upd <- merge(lafd_upd, numHill, by="ZIP", all.x = T)
+lafd_upd$nPark[is.na(lafd_upd$nPark)] <- 0
+
+# add mean by STTYPE, SEQUENCE, firststatus,etc.
+lafd_upd <- lafd_upd %>% group_by(STTYPE) %>% 
+  mutate(Mean_BySTT = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(`Dispatch Sequence`) %>% 
+  mutate(Mean_BySeq = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(firstDispatchStatus) %>% 
+  mutate(Mean_Byfirst = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(nDispatch) %>% 
+  mutate(Mean_BynDis = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(nPark) %>% 
+  mutate(Mean_BynPark = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(nUnitType) %>% 
+  mutate(Mean_BynUnit = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(percentFire) %>% 
+  mutate(Mean_ByFire = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(percentMed) %>% 
+  mutate(Mean_ByMed = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(unitGroup) %>% 
+  mutate(Mean_ByUnitGroup = mean(elapsed_time, na.rm=T))
+lafd_upd <- lafd_upd %>% group_by(zipGroup) %>% 
+  mutate(Mean_ByZipGroup = mean(elapsed_time, na.rm=T))
+
+
+
+
+
+
+################### Do the same thing for test data #################
+#turnout time
+test.wo.r_upd <- test.wo.r_upd %>% mutate(Turnout.Time = ifelse(`PPE Level`=="EMS", 60, 80)) 
+
+#number of dispatch
+test.wo.r_upd <- test.wo.r_upd %>% group_by(incident.ID) %>% mutate(nDispatch = n())
+
+#hour of creation
+test.wo.r_upd$hour <- hour(test.wo.r_upd$`Incident Creation Time (GMT)`)
+
+#number of distinct UnitType
+test.wo.r_upd <- test.wo.r_upd %>% group_by(incident.ID) %>% 
+  mutate(nUnitType=length(unique(`Unit Type`)))
+
+#1st Dispatch Status
+temp <- test.wo.r_upd %>% group_by(incident.ID) %>% 
+  select(incident.ID, `Dispatch Status`) %>% 
+  summarise(firstDispatchStatus=first(`Dispatch Status`))
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="incident.ID", all.x = TRUE)
+
+#Include FS info
+FireStations <- read_csv("FireStations.csv")
+colnames(FireStations)[2] <- "First in District"
+test.wo.r_upd <- merge(test.wo.r_upd, FireStations[,c(2,5,10)], by="First in District", all.x = TRUE)
+
+#Include LA City info
+AllStations2013 <- read_csv("AllStations2013.csv") %>% filter(MONTH=="Overall")
+AllStations2014 <- read_csv("AllStations2014.csv") %>% filter(MONTH=="Overall 2014")
+AllStations2015 <- read_csv("AllStations2015.csv") %>% filter(MONTH=="Overall 2015")
+AllStations2016 <- read_csv("AllStations2016.csv") %>% filter(MONTH=="Overall 2016")
+
+files <- list(AllStations2013, AllStations2014, AllStations2015, AllStations2016)
+stationInfo <- data.frame()
+for (file in files) {
+  tb <- gather(file[,1:5], "PPE Level", "aveTurnout", 4:5)
+  tb <- data.frame(tb, 
+                   gather(file[,c(1:3,6:7)], "PPE Level", "aveTravel", 4:5)[,5])
+  tb <- data.frame(tb, 
+                   gather(file[,c(1:3,8:9)], "PPE Level", "inciCount", 4:5)[,5])
+  tb <- tb[,c(1,2,4:7)]
+  stationInfo <- data.frame(rbind(stationInfo, tb))
+  #tb[,3] <- str_trim(str_sub(tb[,3], start = -7, end = -1))
+}
+colnames(stationInfo)[1:3] <- c("year", "First in District", "PPE Level")
+stationInfo$`PPE Level` <- ifelse(grepl("Non",stationInfo$`PPE Level`), "Non-EMS", "EMS")
+
+stationInfo %>% group_by(year, `PPE Level`, `First in District`) %>% count()
+
+test.wo.r_upd <- merge(test.wo.r_upd, stationInfo, by=c("year","PPE Level", "First in District"), all.x = TRUE)
+test.wo.r_upd[,18:19] <- sapply(test.wo.r_upd[,18:19], as.numeric)
+
+# Include population density info
+popDensity <- read.csv("newVar09_Test.csv")
+colnames(popDensity)[2] <- "PopDensity"
+test.wo.r_upd <- merge(test.wo.r_upd, popDensity, by="row.id", all.x=TRUE)
+
+# change year, hour, zip to categorical
+test.wo.r_upd$year <- as.character(test.wo.r_upd$year)
+test.wo.r_upd$hour <- as.character(test.wo.r_upd$hour)
+test.wo.r_upd$ZIP <- as.character(test.wo.r_upd$ZIP)
+
+# group hour
+test.wo.r_upd$timeOfDay <- ifelse(test.wo.r_upd$hour %in% as.character(c(6:14),2,3,5), "peak", "nonPeak")
+
+# group unitType
+colnames(newVar04_Test)[2] <- "unitGroup"
+test.wo.r_upd <- merge(test.wo.r_upd, newVar04_Test, by="row.id", all.x = T)
+
+# include mean elapsed time by unit
+test.wo.r_upd <- merge(test.wo.r_upd, newVar05_Test, by="row.id", all.x = T)
+
+# include mean response time, mean dispatch time, mean arrival time, slow in seconds, 
+# percent MD, and percent fire
+test.wo.r_upd <- merge(test.wo.r_upd, X911_response, by="First in District", all.x = TRUE)
+test.wo.r_upd$aveProcess <- test.wo.r_upd$ave_response_seconds-test.wo.r_upd$aveTurnout-test.wo.r_upd$aveTravel
+
+# include mean elapsed time by Dispatch Status
+temp <- lafd_upd %>% select(`Dispatch Status`, Mean_ByStatus)
+temp <- unique(temp, by="Dispatch Status")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="Dispatch Status", all.x=TRUE)
+
+# include mean elapsed time by year
+temp <- lafd_upd %>% ungroup() %>% select(year, Mean_ByYear)
+temp <- unique(temp, by="year")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="year", all.x=TRUE)
+
+# include mean elapsed time by hour
+temp <- lafd_upd %>% ungroup() %>% select(hour, Mean_ByHour)
+temp <- unique(temp, by="hour")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="hour", all.x=TRUE)
+
+# include mean elapsed time by zip
+temp <- lafd_upd %>% ungroup() %>% select(ZIP, Mean_ByZip)
+temp <- unique(temp, by="ZIP")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="ZIP", all.x=TRUE)
+
+# include mean elapsed time by PPE
+temp <- lafd_upd %>% ungroup() %>% select(`PPE Level`, Mean_ByPPE)
+temp <- unique(temp, by="PPE Level")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="PPE Level", all.x=TRUE)
+
+# cluster zip
+test.wo.r_upd$zipGroup <- cut(test.wo.r_upd$Mean_ByZip, breaks = c(0,500,700,1000), labels = c("ZipSlow", "ZipNormal", "ZipFast"))
+
+# include park
+test.wo.r_upd <- merge(test.wo.r_upd, numHill, by="ZIP", all.x = T)
+test.wo.r_upd$nPark[is.na(test.wo.r_upd$nPark)] <- 0
+
+# add mean by STTYPE, SEQUENCE, firststatus,etc.
+temp <- lafd_upd %>% ungroup() %>% select(STTYPE, Mean_BySTT)
+temp <- unique(temp, by="STTYPE")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="STTYPE", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(`Dispatch Sequence`, Mean_BySeq)
+temp <- unique(temp, by="Dispatch Sequence")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="Dispatch Sequence", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(firstDispatchStatus, Mean_Byfirst)
+temp <- unique(temp, by="firstDispatchStatus")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="firstDispatchStatus", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(nDispatch, Mean_BynDis)
+temp <- unique(temp, by="nDispatch")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="nDispatch", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(nPark, Mean_BynPark)
+temp <- unique(temp, by="nPark")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="nPark", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(nUnitType, Mean_BynUnit)
+temp <- unique(temp, by="nUnitType")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="nUnitType", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(percentFire, Mean_ByFire)
+temp <- unique(temp, by="percentFire")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="percentFire", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(percentMed, Mean_ByMed)
+temp <- unique(temp, by="percentMed")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="percentMed", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(unitGroup, Mean_ByUnitGroup)
+temp <- unique(temp, by="unitGroup")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="unitGroup", all.x=TRUE)
+
+temp <- lafd_upd %>% ungroup() %>% select(zipGroup, Mean_ByZipGroup)
+temp <- unique(temp, by="zipGroup")
+test.wo.r_upd <- merge(test.wo.r_upd, temp, by="zipGroup", all.x=TRUE)
+
+
+
+
+###################### change column order ##########
+test.wo.r_upd <- test.wo.r_upd[,order(colnames(test.wo.r_upd))]
+lafd_upd <- lafd_upd[,order(colnames(lafd_upd))]
+
+################# convert characters to factors ##############
+fact_col <- colnames(lafd_upd)[sapply(lafd_upd, is.character)]
+
+for(i in fact_col) set(lafd_upd, j=i,value = factor(lafd_upd[[i]]))
+for (i in fact_col) set(test.wo.r_upd, j=i,value = factor(test.wo.r_upd[[i]]))
+
+
+###### ungroup #####
+lafd_upd <- lafd_upd %>% ungroup()
+test.wo.r_upd <- test.wo.r_upd %>% ungroup()
+################## save ####################
+save(lafd_upd, file = "lafd_upd.RData")
+save(test.wo.r_upd, file = "test.wo.r_upd.RData")
+
+```
+
+```{r, model1 public KGI1390489}
+load("lafd_upd139.RData")
+load("test.wo.r_upd139.RData")
+
+lafd_upd$year <- as.integer(as.character(lafd_upd$year))
+test.wo.r_upd$year <- as.integer(as.character(test.wo.r_upd$year))
+
+lafd <- lafd_upd %>% select(year,`Dispatch Sequence`, `Dispatch Status`, 
+                            `Unit Type`, `PPE Level`,
+                            elapsed_time, aveTravel,Mean_ByZip, Mean_ByStatus)
+
+test <- test.wo.r_upd %>% select(year, `Dispatch Sequence`, `Dispatch Status`, 
+                                 `Unit Type`,`PPE Level`, aveTravel,Mean_ByZip, 
+                                 Mean_ByStatus)
+
+which(colnames(lafd)=="Dispatch Status")
+which(colnames(lafd)=="Dispatch Sequence")
+which(colnames(lafd)=="PPE Level")
+which(colnames(lafd)=="Unit Type")
+
+colnames(lafd)[c(3,2,5,4)] <- c("DispatchStatus","DispatchSequence",
+                                "PPE.Level", "UnitType")
+
+which(colnames(test)=="Dispatch Status")
+which(colnames(test)=="Dispatch Sequence")
+which(colnames(test)=="PPE Level")
+which(colnames(test)=="Unit Type")
+colnames(test)[c(3,2,5,4)] <- c("DispatchStatus","DispatchSequence",
+                                "PPE.Level", "UnitType")
+
+
+
+lafd <- na.omit(lafd)
+sapply(lafd, function(x) sum(is.na(x)))
+
+test$DispatchSequence <- ifelse(is.na(test$DispatchSequence), 2, test$DispatchSequence)
+sapply(test, function(x) sum(is.na(x)))
+
+
+new_ts <- sparse.model.matrix(~.-1, data=test) #to calculate prediction
+new_lafd <- sparse.model.matrix(~.-1, data=lafd[,-6])
+
+dlafd <- xgb.DMatrix(data=new_lafd, label=lafd$elapsed_time)
+dtest <- xgb.DMatrix(data = new_ts)
+
+
+params <- list(booster = "gbtree", objective = "reg:linear", 
+               eta=0.12, gamma=0.06, max_depth=6, min_child_weight=1, 
+               colsample_bytree=0.7, subsample=0.7,
+               nthread=4)
+
+
+set.seed(530)
+xgb <- xgb.train(params = params, data = dlafd,
+                 nrounds = 50, print_every_n = 5, verbose = 1)
+xgpred <- predict(xgb, dtest)
+summary(xgpred)
+
+
+mat <- xgb.importance(feature_names = colnames(dlafd),model = xgb)
+xgb.plot.importance(importance_matrix = mat)
+
+sub <- data.frame(test.wo.r_upd$row.id, xgpred)
+colnames(sub) <- c("row.id", "prediction")
+write.table(sub, file = "0.15_50.csv", sep = ",", row.names = FALSE)
+```
+
+```{r, model2 public KGI1403952}
+load("lafd_upd.RData")
+load("test.wo.r_upd.RData")
+
+lafd <- lafd_upd %>% select(-row.id, -incident.ID, -`Emergency Dispatch Code`,
+                            -`Incident Creation Time (GMT)`, -STTYPE, -ZIP)
+
+test <- test.wo.r_upd %>% select(-row.id, -incident.ID, -`Emergency Dispatch Code`,
+                                 -`Incident Creation Time (GMT)`, -STTYPE, -ZIP)
+
+lafd <- na.omit(lafd)
+
+## use dense matrix, factor columns
+
+# param
+params <- list(booster = "gbtree", objective = "reg:linear", 
+               eta=0.1, gamma=0, max_depth=6, min_child_weight=1, 
+               nthread=4)
+
+set.seed(530)
+xg1 <- xgboost(data = data.matrix(lafd[,-9]), label = data.matrix(lafd[,9]), 
+               nrounds = 25, verbose = 1, params = params, print_every_n = 5)
+
+# predicted values
+xgpred <- predict(xg1, data.matrix(test), missing=NA)
+xgpred.val <- ifelse(complete.cases(test.wo.r_upd), xgpred, mean(xgpred))
+summary(xgpred.val)
+length(xgpred.val)
+sub1 <- data.frame(test.wo.r_upd$row.id, xgpred.val)
+colnames(sub1) <- c("row.id", "prediction")
+write.table(sub1, file = "eta0.1.06.03(addPark).csv", sep = ",", row.names = FALSE)
+```
+
